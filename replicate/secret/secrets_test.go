@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"k8s.io/client-go/tools/clientcmd"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/mittwald/kubernetes-replicator/replicate/common"
 	pkgerrors "github.com/pkg/errors"
@@ -37,8 +38,7 @@ type EventHandlerFuncs struct {
 	DeleteFunc func(wg *sync.WaitGroup, obj any)
 }
 
-type PlainFormatter struct {
-}
+type PlainFormatter struct{}
 
 func (pf *PlainFormatter) Format(entry *log.Entry) ([]byte, error) {
 	var b *bytes.Buffer
@@ -63,7 +63,7 @@ func (pf *PlainFormatter) Format(entry *log.Entry) ([]byte, error) {
 
 func setupRealClientSet(t *testing.T) *kubernetes.Clientset {
 	kubeconfig := os.Getenv("KUBECONFIG")
-	//is KUBECONFIG is not specified try to use the local KUBECONFIG or the in cluster config
+	// is KUBECONFIG is not specified try to use the local KUBECONFIG or the in cluster config
 	if len(kubeconfig) == 0 {
 		if home := homeDir(); home != "" && home != "/root" {
 			kubeconfig = filepath.Join(home, ".kube", "config")
@@ -77,7 +77,6 @@ func setupRealClientSet(t *testing.T) *kubernetes.Clientset {
 }
 
 func TestSecretReplicator(t *testing.T) {
-
 	log.SetLevel(log.TraceLevel)
 	log.SetFormatter(&PlainFormatter{})
 
@@ -104,7 +103,8 @@ func TestSecretReplicator(t *testing.T) {
 			Name: prefix + "test2",
 			Labels: map[string]string{
 				"foo": "bar",
-			}},
+			},
+		},
 	}
 	_, err = client.CoreV1().Namespaces().Create(context.TODO(), &ns2, metav1.CreateOptions{})
 	require.NoError(t, err)
@@ -1279,13 +1279,67 @@ func TestSecretReplicator(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, []byte("{}"), updTarget.Data[".dockercfg"])
 		require.Equal(t, corev1.SecretTypeDockercfg, updTarget.Type)
-
 	})
 
+	t.Run("replicate only specific data keys from source to target", func(t *testing.T) {
+		source := corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "source-repl-specific-keys",
+				Namespace: ns.Name,
+				Annotations: map[string]string{
+					common.ReplicateTo:       prefix + "test2",
+					common.ReplicateDataKeys: "foo",
+				},
+			},
+			Type: corev1.SecretTypeOpaque,
+			Data: map[string][]byte{
+				"foo": []byte("Hello Foo"),
+				"bar": []byte("Hello Bar"),
+			},
+		}
+
+		wg, stop := waitForSecrets(client, 2, EventHandlerFuncs{
+			AddFunc: func(wg *sync.WaitGroup, obj any) {
+				secret := obj.(*corev1.Secret)
+				if secret.Namespace == source.Namespace && secret.Name == source.Name {
+					log.Debugf("AddFunc %+v", obj)
+					wg.Done()
+				} else if secret.Namespace == prefix+"test2" && secret.Name == source.Name {
+					log.Debugf("AddFunc %+v", obj)
+					wg.Done()
+				}
+			},
+		})
+		_, err := secrets.Create(context.TODO(), &source, metav1.CreateOptions{})
+		require.NoError(t, err)
+
+		waitWithTimeout(wg, MaxWaitTime)
+		close(stop)
+
+		secrets2 := client.CoreV1().Secrets(prefix + "test2")
+		updTarget, err := secrets2.Get(context.TODO(), source.Name, metav1.GetOptions{})
+
+		require.NoError(t, err)
+		require.Equal(t, []byte("Hello Foo"), updTarget.Data["foo"])
+
+		wg, stop = waitForSecrets(client, 1, EventHandlerFuncs{
+			UpdateFunc: func(wg *sync.WaitGroup, oldObj, newObj any) {
+				secret := oldObj.(*corev1.Secret)
+				if secret.Namespace == prefix+"test2" && secret.Name == source.Name {
+					log.Debugf("UpdateFunc %+v -> %+v", oldObj, newObj)
+					wg.Done()
+				}
+			},
+		})
+
+		waitWithTimeout(wg, MaxWaitTime)
+		close(stop)
+
+		require.NotContains(t, updTarget.Data, "bar")
+	})
 }
 
 func TestSecretReplicatorSyncByContent(t *testing.T) {
-
 	log.SetLevel(log.TraceLevel)
 	log.SetFormatter(&PlainFormatter{})
 
@@ -1392,7 +1446,6 @@ func TestSecretReplicatorSyncByContent(t *testing.T) {
 
 		close(stop)
 	})
-
 }
 
 type createInformerFunc func(factory informers.SharedInformerFactory) cache.SharedIndexInformer
@@ -1413,7 +1466,6 @@ func waitForObjects(client kubernetes.Interface, count int, eventHandlers EventH
 			if eventHandlers.UpdateFunc != nil {
 				eventHandlers.UpdateFunc(wg, oldObj, newObj)
 			}
-
 		},
 		DeleteFunc: func(obj any) {
 			if eventHandlers.DeleteFunc != nil {

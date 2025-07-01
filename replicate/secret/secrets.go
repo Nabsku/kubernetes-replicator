@@ -54,7 +54,7 @@ func NewReplicator(client kubernetes.Interface, resyncPeriod time.Duration, allo
 }
 
 // ReplicateDataFrom takes a source object and copies over data to target object
-func (r *Replicator) ReplicateDataFrom(sourceObj interface{}, targetObj interface{}) error {
+func (r *Replicator) ReplicateDataFrom(sourceObj any, targetObj any) error {
 	source := sourceObj.(*v1.Secret)
 	target := targetObj.(*v1.Secret)
 
@@ -77,6 +77,20 @@ func (r *Replicator) ReplicateDataFrom(sourceObj interface{}, targetObj interfac
 	}
 
 	targetCopy := target.DeepCopy()
+	keys, ok := source.Annotations[common.ReplicateDataKeys]
+	if ok && keys != "" {
+		replicatedKeys := strings.Split(source.Annotations[common.ReplicateDataKeys], ",")
+		for val := range targetCopy.Data {
+			for _, replicatedKey := range replicatedKeys {
+				if val == replicatedKey {
+					continue
+				}
+				logger.Debugf("Removing key %s from target secret %s/%s because it's not specified in filter annotation", val, target.Name, targetCopy.Name)
+				delete(targetCopy.Data, val)
+			}
+		}
+	}
+
 	if targetCopy.Data == nil {
 		targetCopy.Data = make(map[string][]byte)
 	}
@@ -132,8 +146,8 @@ func (r *Replicator) ReplicateDataFrom(sourceObj interface{}, targetObj interfac
 	return err
 }
 
-// ReplicateObjectTo copies the whole object to target namespace
-func (r *Replicator) ReplicateObjectTo(sourceObj interface{}, target *v1.Namespace) error {
+// ReplicateObjectTo copies the whole object or just specific keys to target namespace
+func (r *Replicator) ReplicateObjectTo(sourceObj any, target *v1.Namespace) error {
 	source := sourceObj.(*v1.Secret)
 	targetLocation := fmt.Sprintf("%s/%s", target.Name, source.Name)
 
@@ -162,6 +176,22 @@ func (r *Replicator) ReplicateObjectTo(sourceObj interface{}, target *v1.Namespa
 
 		targetResourceType = targetObject.Type
 		resourceCopy = targetObject.DeepCopy()
+
+		keys, ok := source.Annotations[common.ReplicateDataKeys]
+		// If the source has replicated data keys as annotation, we need to copy only those keys
+		// to the target, otherwise we keep the whole secret.
+		if ok && keys != "" {
+			replicatedKeys := strings.Split(source.Annotations[common.ReplicateDataKeys], ",")
+			for val := range resourceCopy.Data {
+				for _, replicatedKey := range replicatedKeys {
+					if val == replicatedKey {
+						continue
+					}
+					logger.Debugf("Removing key %s from target secret %s/%s because it's not specified in filter annotation", val, target.Name, resourceCopy.Name)
+					delete(resourceCopy.Data, val)
+				}
+			}
+		}
 	} else {
 		resourceCopy = new(v1.Secret)
 	}
@@ -200,7 +230,7 @@ func (r *Replicator) ReplicateObjectTo(sourceObj interface{}, target *v1.Namespa
 	resourceCopy.Annotations[common.ReplicatedFromVersionAnnotation] = source.ResourceVersion
 	resourceCopy.Annotations[common.ReplicatedKeysAnnotation] = strings.Join(replicatedKeys, ",")
 
-	var obj interface{}
+	var obj any
 	if exists {
 		logger.Debugf("Updating existing secret %s/%s", target.Name, resourceCopy.Name)
 		obj, err = r.Client.CoreV1().Secrets(target.Name).Update(context.TODO(), resourceCopy, metav1.UpdateOptions{})
@@ -244,7 +274,7 @@ func (r *Replicator) extractReplicatedKeys(source *v1.Secret, targetLocation str
 	return replicatedKeys
 }
 
-func (r *Replicator) PatchDeleteDependent(sourceKey string, target interface{}) (interface{}, error) {
+func (r *Replicator) PatchDeleteDependent(sourceKey string, target any) (any, error) {
 	dependentKey := common.MustGetKey(target)
 	logger := log.WithFields(log.Fields{
 		"kind":   r.Kind,
@@ -260,7 +290,6 @@ func (r *Replicator) PatchDeleteDependent(sourceKey string, target interface{}) 
 
 	patch := []common.JSONPatchOperation{{Operation: "remove", Path: "/data"}}
 	patchBody, err := json.Marshal(&patch)
-
 	if err != nil {
 		return nil, errors.Wrapf(err, "error while building patch body for secret %s: %v", dependentKey, err)
 	}
@@ -276,7 +305,7 @@ func (r *Replicator) PatchDeleteDependent(sourceKey string, target interface{}) 
 }
 
 // DeleteReplicatedResource deletes a resource replicated by ReplicateTo annotation
-func (r *Replicator) DeleteReplicatedResource(targetResource interface{}) error {
+func (r *Replicator) DeleteReplicatedResource(targetResource any) error {
 	targetLocation := common.MustGetKey(targetResource)
 	logger := log.WithFields(log.Fields{
 		"kind":   r.Kind,
@@ -311,7 +340,6 @@ func (r *Replicator) DeleteReplicatedResource(targetResource interface{}) error 
 		s, err := r.Client.CoreV1().Secrets(object.Namespace).Patch(context.TODO(), object.Name, types.JSONPatchType, patchBody, metav1.PatchOptions{})
 		if err != nil {
 			return errors.Wrapf(err, "error while patching secret %s: %v", s, err)
-
 		}
 
 		logger.Debugf("Not deleting %s since it contains other keys then replicated.", targetLocation)
